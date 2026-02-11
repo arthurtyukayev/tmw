@@ -1,0 +1,816 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly TMUXP_DIR="$HOME/.tmuxp"
+readonly VERSION="0.1.0"
+
+# ─── Colors ──────────────────────────────────────────────
+red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+die() { red "error: $*" >&2; exit 1; }
+warn() { yellow "warning: $*" >&2; }
+info() { green "$*"; }
+
+# ─── Help ────────────────────────────────────────────────
+usage() {
+  cat <<'EOF'
+tmw - tmux worktree manager
+
+Usage: tmw <command> [args]
+
+Commands:
+  init     Generate tmuxp configs for a new project
+  new      Create worktrees and start a tmuxp session
+  kill     Kill session and remove worktrees
+  attach   Re-attach to a worktree session
+  list     List active worktree sessions
+
+Run 'tmw <command> --help' for details and examples.
+EOF
+}
+
+usage_init() {
+  cat <<'EOF'
+Generate tmuxp configs for a new project.
+
+Creates two configs in ~/.tmuxp/:
+  <name>.yaml            Static config for main branch
+  <name>-worktree.yaml   Parameterized for worktrees
+
+Usage:
+  tmw init <name> --type=<type> --backend=<path> [--frontend=<path>]
+
+Options:
+  --type       fullstack or single (required)
+  --backend    Path to backend/main repo (required)
+  --frontend   Path to frontend repo (fullstack only)
+
+Examples:
+  # Fullstack project (backend + frontend)
+  tmw init allcore \
+    --type=fullstack \
+    --backend=~/Projects/allcore/allcore-backend \
+    --frontend=~/Projects/allcore/allcore-frontend
+
+  # Single repo project
+  tmw init mini-tv \
+    --type=single \
+    --backend=~/Projects/Personal/mini-tv
+EOF
+}
+
+usage_new() {
+  cat <<'EOF'
+Create git worktrees and start a tmuxp session.
+
+Creates branch at/<feature> from main in each repo,
+sets up worktree directories as siblings of the repos,
+and launches the tmuxp session.
+
+If worktrees already exist, skips creation and just
+launches the session.
+
+Without a feature name, loads the static config for
+the main branch (no worktrees created).
+
+Usage:
+  tmw new <config> [feature]
+
+Arguments:
+  config    Project name (matches tmuxp config)
+  feature   Feature name (optional; branch and dir suffix)
+
+Examples:
+  # Start main-branch session (static config)
+  tmw new allcore
+
+  # Start worktree session
+  tmw new allcore crud-organizations
+  tmw new mini-tv player-rewrite
+EOF
+}
+
+usage_kill() {
+  cat <<'EOF'
+Kill tmux session and remove worktrees.
+
+Kills the tmux session, removes worktree directories
+from all repos, and prunes. Does not delete branches.
+
+Usage:
+  tmw kill <config> <feature>
+
+Arguments:
+  config    Project name
+  feature   Feature name
+
+Examples:
+  tmw kill allcore crud-organizations
+  tmw kill mini-tv player-rewrite
+EOF
+}
+
+usage_attach() {
+  cat <<'EOF'
+Re-attach to a worktree session.
+
+If the tmux session is running, attaches to it.
+If the session was killed but worktrees still exist,
+re-launches tmuxp and attaches.
+
+Without a feature name, attaches to the main-branch
+session (static config). Re-launches if not running.
+
+Usage:
+  tmw attach <config> [feature]
+
+Arguments:
+  config    Project name
+  feature   Feature name (optional)
+
+Examples:
+  # Attach to main-branch session
+  tmw attach allcore
+
+  # Attach to worktree session
+  tmw attach allcore crud-organizations
+  tmw attach mini-tv player-rewrite
+EOF
+}
+
+usage_list() {
+  cat <<'EOF'
+List active worktree sessions.
+
+Shows all tmw-managed worktree sessions with status.
+Without arguments, lists all projects. With a config
+name, filters to that project.
+
+Usage:
+  tmw list [config]
+
+Arguments:
+  config    Project name (optional, filters output)
+
+Examples:
+  # List all projects
+  tmw list
+
+  # List worktrees for one project
+  tmw list allcore
+
+Output:
+  CONFIG    FEATURE              STATUS
+  allcore   crud-organizations   attached
+  allcore   auth-refactor        detached
+  mini-tv   player-rewrite       no session
+EOF
+}
+
+# ─── Shared Helpers ──────────────────────────────────────
+
+# Read a value from a worktree config's environment block.
+# Usage: parse_config_env <config-name> <key>
+parse_config_env() {
+  local config_file="$TMUXP_DIR/${1}-worktree.yaml"
+  local key="$2"
+  [[ -f "$config_file" ]] || die "config not found: $config_file"
+  grep "^  ${key}:" "$config_file" | sed "s/^  ${key}: *//" | head -1
+}
+
+# Read session_name template from worktree config.
+# Usage: parse_session_template <config-name>
+parse_session_template() {
+  local config_file="$TMUXP_DIR/${1}-worktree.yaml"
+  [[ -f "$config_file" ]] || die "config not found: $config_file"
+  grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1
+}
+
+# Derive actual session name by replacing ${WORKTREE} with feature.
+# Usage: derive_session_name <config-name> <feature>
+derive_session_name() {
+  local template
+  template="$(parse_session_template "$1")"
+  echo "${template//\$\{WORKTREE\}/$2}"
+}
+
+# Derive worktree directory paths.
+# Sets global vars: BACKEND_DIR, FRONTEND_DIR (empty if single)
+# Usage: derive_paths <config-name> <feature>
+derive_paths() {
+  local config="$1" feature="$2"
+  local backend_repo frontend_repo
+
+  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
+  [[ -n "$backend_repo" ]] || die "BACKEND_REPO not found in $config-worktree.yaml"
+
+  BACKEND_DIR="${backend_repo}-${feature}"
+
+  frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO" 2>/dev/null || true)"
+  if [[ -n "$frontend_repo" ]]; then
+    FRONTEND_DIR="${frontend_repo}-${feature}"
+    PROJECT_TYPE="fullstack"
+  else
+    FRONTEND_DIR=""
+    PROJECT_TYPE="single"
+  fi
+}
+
+# Read session_name from the static config.
+# Usage: parse_static_session_name <config-name>
+parse_static_session_name() {
+  local config_file="$TMUXP_DIR/${1}.yaml"
+  [[ -f "$config_file" ]] || die "static config not found: $config_file"
+  grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1
+}
+
+# Check if a tmux session exists.
+# Usage: session_exists <session-name>
+session_exists() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+# ─── init ────────────────────────────────────────────────
+cmd_init() {
+  local name="" type="" backend="" frontend=""
+
+  # First positional arg is the name
+  if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
+    name="$1"; shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)    usage_init; exit 0 ;;
+      --type=*)     type="${1#--type=}" ;;
+      --type)       shift; type="${1:-}" ;;
+      --backend=*)  backend="${1#--backend=}" ;;
+      --backend)    shift; backend="${1:-}" ;;
+      --frontend=*) frontend="${1#--frontend=}" ;;
+      --frontend)   shift; frontend="${1:-}" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  # Validation
+  [[ -n "$name" ]]    || die "name is required. Run 'tmw init --help' for usage."
+  [[ -n "$type" ]]    || die "--type is required (fullstack or single)"
+  [[ -n "$backend" ]] || die "--backend is required"
+
+  [[ "$type" == "fullstack" || "$type" == "single" ]] || \
+    die "--type must be 'fullstack' or 'single'"
+
+  # Expand ~ in paths
+  backend="${backend/#\~/$HOME}"
+  frontend="${frontend/#\~/$HOME}"
+
+  # Resolve to absolute paths
+  backend="$(cd "$backend" 2>/dev/null && pwd)" || die "backend path does not exist: $backend"
+  [[ -d "$backend/.git" || -f "$backend/.git" ]] || die "backend is not a git repo: $backend"
+
+  if [[ "$type" == "fullstack" ]]; then
+    [[ -n "$frontend" ]] || die "--frontend is required for fullstack type"
+    frontend="$(cd "$frontend" 2>/dev/null && pwd)" || die "frontend path does not exist: $frontend"
+    [[ -d "$frontend/.git" || -f "$frontend/.git" ]] || die "frontend is not a git repo: $frontend"
+  else
+    [[ -z "$frontend" ]] || die "--frontend is not allowed for single type"
+  fi
+
+  local static_config="$TMUXP_DIR/${name}.yaml"
+  local worktree_config="$TMUXP_DIR/${name}-worktree.yaml"
+
+  # Generate configs
+  if [[ "$type" == "fullstack" ]]; then
+    _generate_fullstack_static "$name" "$backend" "$frontend" > "$static_config"
+    _generate_fullstack_worktree "$name" "$backend" "$frontend" > "$worktree_config"
+  else
+    _generate_single_static "$name" "$backend" > "$static_config"
+    _generate_single_worktree "$name" "$backend" > "$worktree_config"
+  fi
+
+  info "Created $static_config"
+  info "Created $worktree_config"
+  echo ""
+  echo "Edit the 'srv' window commands in the configs if needed."
+}
+
+_generate_fullstack_static() {
+  local name="$1" backend="$2" frontend="$3"
+  cat <<EOF
+session_name: ${name}
+windows:
+- window_name: nvim
+  layout: even-horizontal
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd ${backend}
+    - nvim .
+  - shell_command:
+    - cd ${frontend}
+    - nvim .
+- window_name: oc
+  panes:
+  - focus: 'true'
+    shell_command: opencode
+  start_directory: ${backend}
+- window_name: srv
+  focus: 'true'
+  layout: even-horizontal
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd ${backend}
+    - pnpm run dev
+  - shell_command:
+    - cd ${frontend}
+    - pnpm run dev
+- window_name: gitui
+  layout: even-horizontal
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd ${backend}
+    - gitui
+  - shell_command:
+    - cd ${frontend}
+    - gitui
+EOF
+}
+
+_generate_single_static() {
+  local name="$1" backend="$2"
+  cat <<EOF
+session_name: ${name}
+windows:
+- window_name: nvim
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd ${backend}
+    - nvim .
+- window_name: oc
+  panes:
+  - focus: 'true'
+    shell_command: opencode
+  start_directory: ${backend}
+- window_name: srv
+  focus: 'true'
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd ${backend}
+    - pnpm run dev
+- window_name: gitui
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd ${backend}
+    - gitui
+EOF
+}
+
+_generate_fullstack_worktree() {
+  local name="$1" backend="$2" frontend="$3"
+  cat <<EOF
+session_name: ${name}-\${WORKTREE}
+environment:
+  BACKEND_REPO: ${backend}
+  FRONTEND_REPO: ${frontend}
+windows:
+- window_name: nvim
+  layout: even-horizontal
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd \${BACKEND}
+    - nvim .
+  - shell_command:
+    - cd \${FRONTEND}
+    - nvim .
+- window_name: oc
+  panes:
+  - focus: 'true'
+    shell_command: opencode
+  start_directory: \${BACKEND}
+- window_name: srv
+  focus: 'true'
+  layout: even-horizontal
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd \${BACKEND}
+    - pnpm run dev
+  - shell_command:
+    - cd \${FRONTEND}
+    - pnpm run dev
+- window_name: gitui
+  layout: even-horizontal
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd \${BACKEND}
+    - gitui
+  - shell_command:
+    - cd \${FRONTEND}
+    - gitui
+EOF
+}
+
+_generate_single_worktree() {
+  local name="$1" backend="$2"
+  cat <<EOF
+session_name: ${name}-\${WORKTREE}
+environment:
+  BACKEND_REPO: ${backend}
+windows:
+- window_name: nvim
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd \${BACKEND}
+    - nvim .
+- window_name: oc
+  panes:
+  - focus: 'true'
+    shell_command: opencode
+  start_directory: \${BACKEND}
+- window_name: srv
+  focus: 'true'
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd \${BACKEND}
+    - pnpm run dev
+- window_name: gitui
+  panes:
+  - focus: 'true'
+    shell_command:
+    - cd \${BACKEND}
+    - gitui
+EOF
+}
+
+# ─── new ─────────────────────────────────────────────────
+cmd_new() {
+  local config="" feature=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage_new; exit 0 ;;
+      -*)        die "unknown option: $1" ;;
+      *)
+        if [[ -z "$config" ]]; then
+          config="$1"
+        elif [[ -z "$feature" ]]; then
+          feature="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$config" ]] || die "config name is required. Run 'tmw new --help' for usage."
+
+  # No feature — load the static (main branch) config
+  if [[ -z "$feature" ]]; then
+    local static_config="$TMUXP_DIR/${config}.yaml"
+    [[ -f "$static_config" ]] || die "static config not found: $static_config. Run 'tmw init' first."
+    info "Launching static session: ${config}"
+    tmuxp load "${config}"
+    return
+  fi
+
+  local config_file="$TMUXP_DIR/${config}-worktree.yaml"
+  [[ -f "$config_file" ]] || die "worktree config not found: $config_file. Run 'tmw init' first."
+
+  # Derive paths
+  derive_paths "$config" "$feature"
+
+  local backend_repo
+  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
+
+  # Create backend worktree if dir doesn't exist
+  if [[ ! -d "$BACKEND_DIR" ]]; then
+    info "Creating backend worktree: $BACKEND_DIR"
+    local branch="at/${feature}"
+    # Check if branch already exists
+    if git -C "$backend_repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
+      info "Branch ${branch} already exists, attaching to it"
+      git -C "$backend_repo" worktree add "$BACKEND_DIR" "$branch"
+    else
+      git -C "$backend_repo" worktree add -b "$branch" "$BACKEND_DIR" main
+    fi
+  else
+    info "Backend worktree already exists: $BACKEND_DIR"
+  fi
+
+  # Create frontend worktree if fullstack
+  if [[ "$PROJECT_TYPE" == "fullstack" ]]; then
+    local frontend_repo
+    frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO")"
+
+    if [[ ! -d "$FRONTEND_DIR" ]]; then
+      info "Creating frontend worktree: $FRONTEND_DIR"
+      local branch="at/${feature}"
+      if git -C "$frontend_repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
+        info "Branch ${branch} already exists, attaching to it"
+        git -C "$frontend_repo" worktree add "$FRONTEND_DIR" "$branch"
+      else
+        git -C "$frontend_repo" worktree add -b "$branch" "$FRONTEND_DIR" main
+      fi
+    else
+      info "Frontend worktree already exists: $FRONTEND_DIR"
+    fi
+  fi
+
+  # Launch tmuxp
+  info "Launching tmuxp session: ${config}-worktree"
+  local -a env_vars=(
+    "WORKTREE=${feature}"
+    "BACKEND=${BACKEND_DIR}"
+  )
+  if [[ "$PROJECT_TYPE" == "fullstack" ]]; then
+    env_vars+=("FRONTEND=${FRONTEND_DIR}")
+  fi
+
+  env "${env_vars[@]}" tmuxp load "${config}-worktree"
+}
+
+# ─── kill ────────────────────────────────────────────────
+cmd_kill() {
+  local config="" feature=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage_kill; exit 0 ;;
+      -*)        die "unknown option: $1" ;;
+      *)
+        if [[ -z "$config" ]]; then
+          config="$1"
+        elif [[ -z "$feature" ]]; then
+          feature="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$config" ]]  || die "config name is required. Run 'tmw kill --help' for usage."
+  [[ -n "$feature" ]] || die "feature name is required. Run 'tmw kill --help' for usage."
+
+  local config_file="$TMUXP_DIR/${config}-worktree.yaml"
+  [[ -f "$config_file" ]] || die "worktree config not found: $config_file"
+
+  # Derive session name and paths
+  local session_name
+  session_name="$(derive_session_name "$config" "$feature")"
+  derive_paths "$config" "$feature"
+
+  local backend_repo
+  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
+
+  # Kill tmux session
+  if session_exists "$session_name"; then
+    info "Killing session: $session_name"
+    tmux kill-session -t "$session_name"
+  else
+    warn "Session not found: $session_name (continuing with cleanup)"
+  fi
+
+  # Remove backend worktree
+  if [[ -d "$BACKEND_DIR" ]]; then
+    info "Removing backend worktree: $BACKEND_DIR"
+    git -C "$backend_repo" worktree remove "$BACKEND_DIR" --force
+  else
+    warn "Backend worktree not found: $BACKEND_DIR"
+  fi
+  git -C "$backend_repo" worktree prune
+
+  # Remove frontend worktree if fullstack
+  if [[ "$PROJECT_TYPE" == "fullstack" ]]; then
+    local frontend_repo
+    frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO")"
+
+    if [[ -d "$FRONTEND_DIR" ]]; then
+      info "Removing frontend worktree: $FRONTEND_DIR"
+      git -C "$frontend_repo" worktree remove "$FRONTEND_DIR" --force
+    else
+      warn "Frontend worktree not found: $FRONTEND_DIR"
+    fi
+    git -C "$frontend_repo" worktree prune
+  fi
+
+  info "Done. Branches were preserved."
+}
+
+# ─── attach ──────────────────────────────────────────────
+cmd_attach() {
+  local config="" feature=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage_attach; exit 0 ;;
+      -*)        die "unknown option: $1" ;;
+      *)
+        if [[ -z "$config" ]]; then
+          config="$1"
+        elif [[ -z "$feature" ]]; then
+          feature="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$config" ]] || die "config name is required. Run 'tmw attach --help' for usage."
+
+  # No feature — attach to the static (main branch) session
+  if [[ -z "$feature" ]]; then
+    local static_config="$TMUXP_DIR/${config}.yaml"
+    [[ -f "$static_config" ]] || die "static config not found: $static_config. Run 'tmw init' first."
+
+    local session_name
+    session_name="$(parse_static_session_name "$config")"
+
+    # Session running — attach
+    if session_exists "$session_name"; then
+      info "Attaching to session: $session_name"
+      tmux attach-session -t "$session_name"
+      return
+    fi
+
+    # No session — re-launch via tmuxp
+    info "Session not found. Re-launching tmuxp: ${config}"
+    tmuxp load "${config}"
+    return
+  fi
+
+  local config_file="$TMUXP_DIR/${config}-worktree.yaml"
+  [[ -f "$config_file" ]] || die "worktree config not found: $config_file"
+
+  local session_name
+  session_name="$(derive_session_name "$config" "$feature")"
+  derive_paths "$config" "$feature"
+
+  # Case 1: Session exists — attach directly
+  if session_exists "$session_name"; then
+    info "Attaching to session: $session_name"
+    tmux attach-session -t "$session_name"
+    return
+  fi
+
+  # Case 2: No session but worktrees exist — re-launch tmuxp
+  if [[ -d "$BACKEND_DIR" ]]; then
+    info "Session not found, but worktrees exist. Re-launching tmuxp..."
+    local -a env_vars=(
+      "WORKTREE=${feature}"
+      "BACKEND=${BACKEND_DIR}"
+    )
+    if [[ "$PROJECT_TYPE" == "fullstack" && -d "$FRONTEND_DIR" ]]; then
+      env_vars+=("FRONTEND=${FRONTEND_DIR}")
+    fi
+    env "${env_vars[@]}" tmuxp load "${config}-worktree"
+    return
+  fi
+
+  # Case 3: Nothing exists
+  die "No session or worktrees found for '${config} ${feature}'. Run 'tmw new ${config} ${feature}' first."
+}
+
+# ─── list ────────────────────────────────────────────────
+cmd_list() {
+  local filter_config=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage_list; exit 0 ;;
+      -*)        die "unknown option: $1" ;;
+      *)
+        if [[ -z "$filter_config" ]]; then
+          filter_config="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  # Get active tmux sessions
+  local tmux_sessions=""
+  tmux_sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+
+  # Get current attached session (if any)
+  local attached_session=""
+  attached_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+
+  # Header
+  printf "%-14s %-24s %s\n" "CONFIG" "FEATURE" "STATUS"
+  printf "%-14s %-24s %s\n" "------" "-------" "------"
+
+  local found=0
+
+  # Scan worktree configs
+  for config_file in "$TMUXP_DIR"/*-worktree.yaml; do
+    [[ -f "$config_file" ]] || continue
+
+    local config_name
+    config_name="$(basename "$config_file" | sed 's/-worktree\.yaml$//')"
+
+    # Apply filter
+    if [[ -n "$filter_config" && "$config_name" != "$filter_config" ]]; then
+      continue
+    fi
+
+    # Get backend repo from config
+    local backend_repo
+    backend_repo="$(grep '^ *BACKEND_REPO:' "$config_file" | sed 's/^ *BACKEND_REPO: *//' | head -1)"
+    [[ -n "$backend_repo" ]] || continue
+
+    # List worktrees for this repo
+    local worktree_list
+    worktree_list="$(git -C "$backend_repo" worktree list --porcelain 2>/dev/null || true)"
+
+    # Parse worktrees — find those that are siblings of the repo with config name prefix
+    local repo_parent repo_basename
+    repo_parent="$(dirname "$backend_repo")"
+    repo_basename="$(basename "$backend_repo")"
+
+    # Look for worktree dirs matching <repo-basename>-<feature>
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^worktree\ (.+)$ ]]; then
+        local wt_path="${BASH_REMATCH[1]}"
+        local wt_basename
+        wt_basename="$(basename "$wt_path")"
+
+        # Check if this worktree matches our naming convention
+        if [[ "$wt_basename" == "${repo_basename}-"* ]]; then
+          local feature="${wt_basename#${repo_basename}-}"
+
+          # Derive session name
+          local session_template
+          session_template="$(grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1)"
+          local session_name="${session_template//\$\{WORKTREE\}/$feature}"
+
+          # Determine status
+          local status="no session"
+          if echo "$tmux_sessions" | grep -qx "$session_name" 2>/dev/null; then
+            if [[ "$session_name" == "$attached_session" ]]; then
+              status="attached"
+            else
+              status="detached"
+            fi
+          fi
+
+          printf "%-14s %-24s %s\n" "$config_name" "$feature" "$status"
+          found=1
+        fi
+      fi
+    done <<< "$worktree_list"
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "No worktree sessions found."
+  fi
+}
+
+# ─── Main Dispatcher ─────────────────────────────────────
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    init)     cmd_init "$@" ;;
+    new)      cmd_new "$@" ;;
+    kill)     cmd_kill "$@" ;;
+    attach)   cmd_attach "$@" ;;
+    list|ls)  cmd_list "$@" ;;
+    --help|-h|help) usage; exit 0 ;;
+    --version|-v)   echo "tmw $VERSION"; exit 0 ;;
+    *)        die "unknown command: $cmd. Run 'tmw --help' for usage." ;;
+  esac
+}
+
+main "$@"

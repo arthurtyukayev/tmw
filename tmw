@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly TMUXP_DIR="$HOME/.tmuxp"
-readonly VERSION="0.1.0"
+readonly VERSION="0.1.1"
 
 # ─── Colors ──────────────────────────────────────────────
 red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }

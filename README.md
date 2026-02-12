@@ -81,11 +81,15 @@ TMW SPECIFICATION
 
 7.  Dependencies
 
-   tmux(1), tmuxp(1), git(1)
+    tmux [1], tmuxp [2], git [3]
+
+    [1]: https://github.com/tmux/tmux
+    [2]: https://github.com/tmux-python/tmuxp
+    [3]: https://git-scm.com/
 
 
 Author's Address
 
-   TMW Contributors
+   Arthur Tyukayev
    https://github.com/arthurtyukayev/tmw
 ```

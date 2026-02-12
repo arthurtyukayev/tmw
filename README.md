@@ -32,7 +32,7 @@ TMW SPECIFICATION
          tmw init myproject --type=single --backend=~/Projects/myproject
 
    new CONFIG FEATURE
-      Create worktrees and start tmuxp session. Creates branch at/FEATURE
+      Create worktrees and start tmuxp session. Creates branch FEATURE
       from main. If worktrees exist, skips creation and launches.
 
    attach CONFIG FEATURE

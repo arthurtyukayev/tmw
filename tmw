@@ -4,6 +4,61 @@ set -euo pipefail
 readonly TMUXP_DIR="$HOME/.tmuxp"
 readonly VERSION="0.1.2"
 
+# ─── Configuration ───────────────────────────────────────
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tmw"
+readonly CONFIG_FILE="$CONFIG_DIR/config.yml"
+
+# Load branch prefix from config file (defaults to empty)
+get_branch_prefix() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local prefix
+    prefix=$(grep -E '^branch_prefix:' "$CONFIG_FILE" | sed 's/^branch_prefix:[[:space:]]*//' | tr -d '"' | tr -d "'")
+    echo "$prefix"
+  else
+    echo ""
+  fi
+}
+
+# Detect the default branch of a git repository (main, master, etc.)
+get_default_branch() {
+  local repo_path="$1"
+  local default_branch
+  default_branch=$(git -C "$repo_path" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+  if [[ -z "$default_branch" ]]; then
+    # Fallback to checking for common branch names
+    for branch in main master trunk develop; do
+      if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+        echo "$branch"
+        return
+      fi
+    done
+    die "Cannot determine default branch for repository: $repo_path"
+  fi
+  echo "$default_branch"
+}
+
+# Find tmuxp config file with either .yaml or .yml extension
+# Usage: find_config_file "name" "type" (type: static or worktree)
+find_config_file() {
+  local name="$1"
+  local type="${2:-static}"
+  local extensions=("yaml" "yml")
+
+  for ext in "${extensions[@]}"; do
+    local config_file
+    if [[ "$type" == "worktree" ]]; then
+      config_file="$TMUXP_DIR/${name}.worktree.${ext}"
+    else
+      config_file="$TMUXP_DIR/${name}.${ext}"
+    fi
+    [[ -f "$config_file" ]] && { echo "$config_file"; return 0; }
+  done
+
+  return 1
+}
+
+
+
 # ─── Colors ──────────────────────────────────────────────
 red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
@@ -176,17 +231,17 @@ EOF
 # Read a value from a worktree config's environment block.
 # Usage: parse_config_env <config-name> <key>
 parse_config_env() {
-  local config_file="$TMUXP_DIR/${1}.worktree.yaml"
+  local config_file
+  config_file=$(find_config_file "$1" "worktree") || die "config not found for: $1"
   local key="$2"
-  [[ -f "$config_file" ]] || die "config not found: $config_file"
   grep "^  ${key}:" "$config_file" | sed "s/^  ${key}: *//" | head -1
 }
 
 # Read session_name template from worktree config.
 # Usage: parse_session_template <config-name>
 parse_session_template() {
-  local config_file="$TMUXP_DIR/${1}.worktree.yaml"
-  [[ -f "$config_file" ]] || die "config not found: $config_file"
+  local config_file
+  config_file=$(find_config_file "$1" "worktree") || die "config not found for: $1"
   grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1
 }
 
@@ -206,7 +261,7 @@ derive_paths() {
   local backend_repo frontend_repo
 
   backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
-  [[ -n "$backend_repo" ]] || die "BACKEND_REPO not found in $config.worktree.yaml"
+  [[ -n "$backend_repo" ]] || die "BACKEND_REPO not found in worktree config for: $config"
 
   BACKEND_DIR="${backend_repo}-${feature}"
 
@@ -223,8 +278,8 @@ derive_paths() {
 # Read session_name from the static config.
 # Usage: parse_static_session_name <config-name>
 parse_static_session_name() {
-  local config_file="$TMUXP_DIR/${1}.yaml"
-  [[ -f "$config_file" ]] || die "static config not found: $config_file"
+  local config_file
+  config_file=$(find_config_file "$1" "static") || die "static config not found for: $1"
   grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1
 }
 
@@ -487,15 +542,15 @@ cmd_new() {
 
   # No feature — load the static (main branch) config
   if [[ -z "$feature" ]]; then
-    local static_config="$TMUXP_DIR/${config}.yaml"
-    [[ -f "$static_config" ]] || die "static config not found: $static_config. Run 'tmw init' first."
+    local static_config
+    static_config=$(find_config_file "$config" "static") || die "static config not found for: $config. Run 'tmw init' first."
     info "Launching static session: ${config}"
-    tmuxp load "${config}"
+    tmuxp load "$static_config"
     return
   fi
 
-  local config_file="$TMUXP_DIR/${config}.worktree.yaml"
-  [[ -f "$config_file" ]] || die "worktree config not found: $config_file. Run 'tmw init' first."
+  local config_file
+  config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config. Run 'tmw init' first."
 
   # Derive paths
   derive_paths "$config" "$feature"
@@ -506,13 +561,17 @@ cmd_new() {
   # Create backend worktree if dir doesn't exist
   if [[ ! -d "$BACKEND_DIR" ]]; then
     info "Creating backend worktree: $BACKEND_DIR"
-    local branch="at/${feature}"
+    local prefix
+    prefix=$(get_branch_prefix)
+    local branch="${prefix}${feature}"
     # Check if branch already exists
     if git -C "$backend_repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
       info "Branch ${branch} already exists, attaching to it"
       git -C "$backend_repo" worktree add "$BACKEND_DIR" "$branch"
     else
-      git -C "$backend_repo" worktree add -b "$branch" "$BACKEND_DIR" main
+      local default_branch
+      default_branch=$(get_default_branch "$backend_repo")
+      git -C "$backend_repo" worktree add -b "$branch" "$BACKEND_DIR" "$default_branch"
     fi
   else
     info "Backend worktree already exists: $BACKEND_DIR"
@@ -525,12 +584,16 @@ cmd_new() {
 
     if [[ ! -d "$FRONTEND_DIR" ]]; then
       info "Creating frontend worktree: $FRONTEND_DIR"
-      local branch="at/${feature}"
+      local prefix
+      prefix=$(get_branch_prefix)
+      local branch="${prefix}${feature}"
       if git -C "$frontend_repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
         info "Branch ${branch} already exists, attaching to it"
         git -C "$frontend_repo" worktree add "$FRONTEND_DIR" "$branch"
       else
-        git -C "$frontend_repo" worktree add -b "$branch" "$FRONTEND_DIR" main
+        local default_branch
+        default_branch=$(get_default_branch "$frontend_repo")
+        git -C "$frontend_repo" worktree add -b "$branch" "$FRONTEND_DIR" "$default_branch"
       fi
     else
       info "Frontend worktree already exists: $FRONTEND_DIR"
@@ -547,7 +610,7 @@ cmd_new() {
     env_vars+=("FRONTEND=${FRONTEND_DIR}")
   fi
 
-  env "${env_vars[@]}" tmuxp load "${config}.worktree"
+  env "${env_vars[@]}" tmuxp load "$config_file"
 }
 
 # ─── kill ────────────────────────────────────────────────
@@ -574,8 +637,8 @@ cmd_kill() {
   [[ -n "$config" ]]  || die "config name is required. Run 'tmw kill --help' for usage."
   [[ -n "$feature" ]] || die "feature name is required. Run 'tmw kill --help' for usage."
 
-  local config_file="$TMUXP_DIR/${config}.worktree.yaml"
-  [[ -f "$config_file" ]] || die "worktree config not found: $config_file"
+  local config_file
+  config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config"
 
   # Derive session name and paths
   local session_name
@@ -646,13 +709,15 @@ cmd_attach() {
       tmux attach-session -t "$static_session"
     else
       info "Session not running, launching: $static_session"
-      tmuxp load "$config"
+      local static_config
+      static_config=$(find_config_file "$config" "static") || die "static config not found for: $config"
+      tmuxp load "$static_config"
     fi
     return
   fi
 
-  local config_file="$TMUXP_DIR/${config}.worktree.yaml"
-  [[ -f "$config_file" ]] || die "worktree config not found: $config_file"
+  local config_file
+  config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config"
 
   # Derive session name and paths
   local session_name
@@ -676,7 +741,7 @@ cmd_attach() {
     if [[ "$PROJECT_TYPE" == "fullstack" && -d "$FRONTEND_DIR" ]]; then
       env_vars+=("FRONTEND=${FRONTEND_DIR}")
     fi
-    env "${env_vars[@]}" tmuxp load "${config}.worktree"
+    env "${env_vars[@]}" tmuxp load "$config_file"
     return
   fi
 
@@ -717,12 +782,12 @@ cmd_list() {
 
   local found=0
 
-  # Scan worktree configs
-  for config_file in "$TMUXP_DIR"/*.worktree.yaml; do
+  # Scan worktree configs (support both .yaml and .yml)
+  for config_file in "$TMUXP_DIR"/*.worktree.{yaml,yml}; do
     [[ -f "$config_file" ]] || continue
 
     local config_name
-    config_name="$(basename "$config_file" | sed 's/\.worktree\.yaml$//')"
+    config_name="$(basename "$config_file" | sed -E 's/\.worktree\.ya?ml$//')"
 
     # Apply filter
     if [[ -n "$filter_config" && "$config_name" != "$filter_config" ]]; then

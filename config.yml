@@ -1,0 +1,6 @@
+# TMW Configuration
+# This file configures tmw (tmux worktree manager) settings
+
+# Branch prefix configuration
+# Set to empty string "" for no prefix, or any string like "feature/", "at/", etc.
+branch_prefix: ""

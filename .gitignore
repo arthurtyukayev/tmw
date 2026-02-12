@@ -15,6 +15,9 @@
 credentials.json
 serviceAccountKey.json
 
+# Internal docs
+plans/
+
 # Editor
 *.swp
 *.swo

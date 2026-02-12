@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Environment / secrets
+*.env
+*.env.*
+.env.local
+.env.production
+
+# Keys / certificates
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+serviceAccountKey.json
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

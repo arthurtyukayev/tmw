@@ -56,7 +56,19 @@ TMW SPECIFICATION
    ~/.tmuxp/NAME.worktree.yaml        Worktree config (parameterized)
 
 
-5.  Version Management
+5.  Configuration
+
+   TMW uses a config file at ~/.config/tmw/config.yml for settings.
+
+   Settings:
+      branch_prefix     Prefix for git branches created by 'new' command
+                        Set to "" for no prefix, or use "feature/", "at/", etc.
+
+   Example config.yml:
+      branch_prefix: "feature/"
+
+
+6.  Version Management
 
    make version    Show current version
    make patch      Bump patch (0.1.0 -> 0.1.1)
@@ -67,7 +79,7 @@ TMW SPECIFICATION
    make uninstall  Remove from /usr/local/bin
 
 
-6.  Dependencies
+7.  Dependencies
 
    tmux(1), tmuxp(1), git(1)
 

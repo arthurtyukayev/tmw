@@ -91,5 +91,5 @@ TMW SPECIFICATION
 Author's Address
 
    Arthur Tyukayev
-   https://github.com/arthurtyukayev/tmw
+   https://github.com/arthurtyukayev
 ```

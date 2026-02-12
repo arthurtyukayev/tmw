@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly TMUXP_DIR="$HOME/.tmuxp"
-readonly VERSION="0.1.1"
+readonly VERSION="0.1.2"
 
 # ─── Colors ──────────────────────────────────────────────
 red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
@@ -582,9 +582,79 @@ cmd_kill() {
   session_name="$(derive_session_name "$config" "$feature")"
   derive_paths "$config" "$feature"
 
+  # Kill tmux session if it exists
+  if session_exists "$session_name"; then
+    info "Killing session: $session_name"
+    tmux kill-session -t "$session_name"
+  else
+    warn "Session not found: $session_name"
+  fi
+
+  # Remove worktrees
+  local backend_repo frontend_repo
+  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
+
+  if [[ -d "$BACKEND_DIR" ]]; then
+    info "Removing backend worktree: $BACKEND_DIR"
+    git -C "$backend_repo" worktree remove "$BACKEND_DIR" 2>/dev/null || \
+      git -C "$backend_repo" worktree remove --force "$BACKEND_DIR" 2>/dev/null || \
+      warn "Failed to remove backend worktree"
+  fi
+
+  if [[ "$PROJECT_TYPE" == "fullstack" ]]; then
+    frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO")"
+    if [[ -d "$FRONTEND_DIR" ]]; then
+      info "Removing frontend worktree: $FRONTEND_DIR"
+      git -C "$frontend_repo" worktree remove "$FRONTEND_DIR" 2>/dev/null || \
+        git -C "$frontend_repo" worktree remove --force "$FRONTEND_DIR" 2>/dev/null || \
+        warn "Failed to remove frontend worktree"
+    fi
+  fi
+
+  info "Worktrees cleaned up for ${config} ${feature}"
+}
+
+# ─── attach ────────────────────────────────────────────────
+cmd_attach() {
+  local config="" feature=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage_attach; exit 0 ;;
+      -*)        die "unknown option: $1" ;;
+      *)
+        if [[ -z "$config" ]]; then
+          config="$1"
+        elif [[ -z "$feature" ]]; then
+          feature="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$config" ]] || die "config name is required. Run 'tmw attach --help' for usage."
+
+  # No feature — attach to main-branch session
+  if [[ -z "$feature" ]]; then
+    local static_session
+    static_session="$(parse_static_session_name "$config")"
+    if session_exists "$static_session"; then
+      info "Attaching to session: $static_session"
+      tmux attach-session -t "$static_session"
+    else
+      info "Session not running, launching: $static_session"
+      tmuxp load "$config"
+    fi
+    return
+  fi
+
   local config_file="$TMUXP_DIR/${config}.worktree.yaml"
   [[ -f "$config_file" ]] || die "worktree config not found: $config_file"
 
+  # Derive session name and paths
   local session_name
   session_name="$(derive_session_name "$config" "$feature")"
   derive_paths "$config" "$feature"
@@ -606,7 +676,7 @@ cmd_kill() {
     if [[ "$PROJECT_TYPE" == "fullstack" && -d "$FRONTEND_DIR" ]]; then
       env_vars+=("FRONTEND=${FRONTEND_DIR}")
     fi
-  env "${env_vars[@]}" tmuxp load "${config}.worktree"
+    env "${env_vars[@]}" tmuxp load "${config}.worktree"
     return
   fi
 

@@ -27,6 +27,7 @@ Commands:
   kill     Kill session and remove worktrees
   attach   Re-attach to a worktree session
   list     List active worktree sessions
+  version  Show version information
 
 Run 'tmw <command> --help' for details and examples.
 EOF
@@ -726,6 +727,7 @@ main() {
     kill)     cmd_kill "$@" ;;
     attach)   cmd_attach "$@" ;;
     list|ls)  cmd_list "$@" ;;
+    version)  echo "tmw $VERSION"; exit 0 ;;
     --help|-h|help) usage; exit 0 ;;
     --version|-v)   echo "tmw $VERSION"; exit 0 ;;
     *)        die "unknown command: $cmd. Run 'tmw --help' for usage." ;;

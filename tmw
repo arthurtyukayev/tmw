@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly TMUXP_DIR="$HOME/.tmuxp"
-readonly VERSION="0.1.3"
+readonly VERSION="0.1.4"
 
 # ─── Configuration ───────────────────────────────────────
 readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tmw"
@@ -69,6 +69,19 @@ die() { red "error: $*" >&2; exit 1; }
 warn() { yellow "warning: $*" >&2; }
 info() { green "$*"; }
 
+# Verify required external commands are available.
+require_command() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "missing dependency: '$cmd' is not installed or not in PATH"
+}
+
+require_commands() {
+  local cmd
+  for cmd in "$@"; do
+    require_command "$cmd"
+  done
+}
+
 # ─── Help ────────────────────────────────────────────────
 usage() {
   cat <<'EOF'
@@ -80,7 +93,7 @@ Commands:
   init     Generate tmuxp configs for a new project
   new      Create worktrees and start a tmuxp session
   kill     Kill session and remove worktrees
-  attach   Re-attach to a worktree session
+  attach   Attach to an existing session
   list     List active worktree sessions
   version  Show version information
 
@@ -171,14 +184,13 @@ EOF
 
 usage_attach() {
   cat <<'EOF'
-Re-attach to a worktree session.
+Attach to an existing tmux session.
 
-If the tmux session is running, attaches to it.
-If the session was killed but worktrees still exist,
-re-launches tmuxp and attaches.
+Attaches only if the tmux session is already running.
+If the session does not exist, exits with an error.
 
 Without a feature name, attaches to the main-branch
-session (static config). Re-launches if not running.
+session (static config).
 
 Usage:
   tmw attach <config> [feature]
@@ -708,45 +720,26 @@ cmd_attach() {
       info "Attaching to session: $static_session"
       tmux attach-session -t "$static_session"
     else
-      info "Session not running, launching: $static_session"
-      local static_config
-      static_config=$(find_config_file "$config" "static") || die "static config not found for: $config"
-      tmuxp load "$static_config"
+      die "Session not found: $static_session. Run 'tmw new $config' first."
     fi
     return
   fi
 
-  local config_file
-  config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config"
+  # Validate worktree config exists and derive session name
+  find_config_file "$config" "worktree" >/dev/null || die "worktree config not found for: $config"
 
-  # Derive session name and paths
+  # Derive session name
   local session_name
   session_name="$(derive_session_name "$config" "$feature")"
-  derive_paths "$config" "$feature"
 
-  # Case 1: Session exists — attach directly
+  # Session exists — attach directly
   if session_exists "$session_name"; then
     info "Attaching to session: $session_name"
     tmux attach-session -t "$session_name"
     return
   fi
 
-  # Case 2: No session but worktrees exist — re-launch tmuxp
-  if [[ -d "$BACKEND_DIR" ]]; then
-    info "Session not found, but worktrees exist. Re-launching tmuxp..."
-    local -a env_vars=(
-      "WORKTREE=${feature}"
-      "BACKEND=${BACKEND_DIR}"
-    )
-    if [[ "$PROJECT_TYPE" == "fullstack" && -d "$FRONTEND_DIR" ]]; then
-      env_vars+=("FRONTEND=${FRONTEND_DIR}")
-    fi
-    env "${env_vars[@]}" tmuxp load "$config_file"
-    return
-  fi
-
-  # Case 3: Nothing exists
-  die "No session or worktrees found for '${config} ${feature}'. Run 'tmw new ${config} ${feature}' first."
+  die "Session not found: $session_name. Run 'tmw new ${config} ${feature}' first."
 }
 
 # ─── list ────────────────────────────────────────────────
@@ -857,11 +850,26 @@ main() {
   shift
 
   case "$cmd" in
-    init)     cmd_init "$@" ;;
-    new)      cmd_new "$@" ;;
-    kill)     cmd_kill "$@" ;;
-    attach)   cmd_attach "$@" ;;
-    list|ls)  cmd_list "$@" ;;
+    init)
+      require_commands git
+      cmd_init "$@"
+      ;;
+    new)
+      require_commands git tmuxp
+      cmd_new "$@"
+      ;;
+    kill)
+      require_commands git tmux
+      cmd_kill "$@"
+      ;;
+    attach)
+      require_commands tmux
+      cmd_attach "$@"
+      ;;
+    list|ls)
+      require_commands git tmux
+      cmd_list "$@"
+      ;;
     version)  echo "tmw $VERSION"; exit 0 ;;
     --help|-h|help) usage; exit 0 ;;
     --version|-v)   echo "tmw $VERSION"; exit 0 ;;

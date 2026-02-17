@@ -31,16 +31,29 @@ TMW SPECIFICATION
               --frontend=~/Projects/frontend
          tmw init myproject --type=single --backend=~/Projects/myproject
 
-   new CONFIG FEATURE
-      Create worktrees and start tmuxp session. Creates branch FEATURE
-      from main. If worktrees exist, skips creation and launches.
+   new CONFIG [FEATURE]
+      If FEATURE is omitted, loads the static config (main-branch
+      session).
 
-   attach CONFIG FEATURE
-      Re-attach to an existing worktree session. If session missing but
-      worktrees exist, re-launches tmuxp.
+      If FEATURE is provided, creates worktrees and starts tmuxp
+      session. Creates branch <branch_prefix><FEATURE> from the repo
+      default branch (origin/HEAD when available; fallback order:
+      main, master, trunk, develop). If worktrees exist, skips
+      creation and launches.
+
+   attach CONFIG [FEATURE]
+      If FEATURE is omitted, attaches to static session.
+
+      If FEATURE is provided, re-attaches to an existing worktree
+      session.
+
+      attach only attaches to an existing tmux session. If the
+      requested session does not exist, command fails and suggests
+      tmw new.
 
    kill CONFIG FEATURE
       Kill tmux session and remove worktrees. Git branches preserved.
+      Does not run git worktree prune automatically.
 
    list [CONFIG]
       List active worktree sessions. Without CONFIG, shows all projects.
@@ -54,11 +67,24 @@ TMW SPECIFICATION
    ~/.local/bin/tmw                   Main executable
    ~/.tmuxp/NAME.yaml                 Static config (main branch)
    ~/.tmuxp/NAME.worktree.yaml        Worktree config (parameterized)
+   ~/.tmuxp/NAME.yml                  Also recognized for static config
+   ~/.tmuxp/NAME.worktree.yml         Also recognized for worktree config
 
 
-5.  Configuration
+5.  Template Generation
 
-   TMW uses a config file at ~/.config/tmw/config.yml for settings.
+   tmuxp templates are embedded directly in the tmw script (heredocs).
+   tmw init renders these templates and writes files into ~/.tmuxp on
+   demand.
+
+   There are no standalone .tmuxp template files committed in this
+   repository.
+
+
+6.  Configuration
+
+   TMW uses a config file at
+   ${XDG_CONFIG_HOME:-~/.config}/tmw/config.yml for settings.
 
    Settings:
       branch_prefix     Prefix for git branches created by 'new' command
@@ -68,7 +94,7 @@ TMW SPECIFICATION
       branch_prefix: "feature/"
 
 
-6.  Version Management
+7.  Version Management
 
    make version    Show current version
    make patch      Bump patch (0.1.0 -> 0.1.1)
@@ -79,9 +105,19 @@ TMW SPECIFICATION
    make uninstall  Remove from /usr/local/bin
 
 
-7.  Dependencies
+8.  Dependencies
 
-    tmux [1], tmuxp [2], git [3]
+     Required:
+        tmux [1], tmuxp [2], git [3]
+
+     tmw validates required commands at runtime and exits with a clear
+     error if a dependency is missing from PATH.
+
+     Default generated windows also assume these commands exist:
+        nvim, opencode, pnpm, gitui
+
+     After tmw init, edit generated configs if your dev commands differ
+     (especially in the srv window).
 
     [1]: https://github.com/tmux/tmux
     [2]: https://github.com/tmux-python/tmuxp

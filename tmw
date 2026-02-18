@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly TMUXP_DIR="$HOME/.tmuxp"
-readonly VERSION="0.1.4"
+readonly VERSION="0.1.5"
 
 # ─── Configuration ───────────────────────────────────────
 readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tmw"
@@ -12,10 +12,12 @@ readonly CONFIG_FILE="$CONFIG_DIR/config.yml"
 get_branch_prefix() {
   if [[ -f "$CONFIG_FILE" ]]; then
     local prefix
-    prefix=$(grep -E '^branch_prefix:' "$CONFIG_FILE" | sed 's/^branch_prefix:[[:space:]]*//' | tr -d '"' | tr -d "'")
-    echo "$prefix"
+    prefix="$(sed -n '/^branch_prefix:/ { s/^branch_prefix:[[:space:]]*//; p; q; }' "$CONFIG_FILE")"
+    prefix="${prefix//\"/}"
+    prefix="${prefix//\'/}"
+    printf '%s\n' "$prefix"
   else
-    echo ""
+    printf '\n'
   fi
 }
 
@@ -241,45 +243,40 @@ EOF
 # ─── Shared Helpers ──────────────────────────────────────
 
 # Read a value from a worktree config's environment block.
-# Usage: parse_config_env <config-name> <key>
+# Usage: parse_config_env <config-file> <key>
 parse_config_env() {
-  local config_file
-  config_file=$(find_config_file "$1" "worktree") || die "config not found for: $1"
-  local key="$2"
-  grep "^  ${key}:" "$config_file" | sed "s/^  ${key}: *//" | head -1
+  local config_file="$1" key="$2"
+  sed -n "/^  ${key}:/ { s/^  ${key}: *//; p; q; }" "$config_file"
 }
 
 # Read session_name template from worktree config.
-# Usage: parse_session_template <config-name>
+# Usage: parse_session_template <config-file>
 parse_session_template() {
-  local config_file
-  config_file=$(find_config_file "$1" "worktree") || die "config not found for: $1"
-  grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1
+  local config_file="$1"
+  sed -n '/^session_name:/ { s/^session_name: *//; p; q; }' "$config_file"
 }
 
 # Derive actual session name by replacing ${WORKTREE} with feature.
-# Usage: derive_session_name <config-name> <feature>
+# Usage: derive_session_name <template> <feature>
 derive_session_name() {
-  local template
-  template="$(parse_session_template "$1")"
-  echo "${template//\$\{WORKTREE\}/$2}"
+  local template="$1" feature="$2"
+  printf '%s\n' "${template//\$\{WORKTREE\}/$feature}"
 }
 
 # Derive worktree directory paths.
-# Sets global vars: BACKEND_DIR, FRONTEND_DIR (empty if single)
-# Usage: derive_paths <config-name> <feature>
+# Sets global vars: BACKEND_DIR, FRONTEND_DIR (empty if single), BACKEND_REPO, FRONTEND_REPO
+# Usage: derive_paths <config-file> <feature>
 derive_paths() {
-  local config="$1" feature="$2"
-  local backend_repo frontend_repo
+  local config_file="$1" feature="$2"
 
-  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
-  [[ -n "$backend_repo" ]] || die "BACKEND_REPO not found in worktree config for: $config"
+  BACKEND_REPO="$(parse_config_env "$config_file" "BACKEND_REPO")"
+  [[ -n "$BACKEND_REPO" ]] || die "BACKEND_REPO not found in worktree config"
 
-  BACKEND_DIR="${backend_repo}-${feature}"
+  BACKEND_DIR="${BACKEND_REPO}-${feature}"
 
-  frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO" 2>/dev/null || true)"
-  if [[ -n "$frontend_repo" ]]; then
-    FRONTEND_DIR="${frontend_repo}-${feature}"
+  FRONTEND_REPO="$(parse_config_env "$config_file" "FRONTEND_REPO" 2>/dev/null || true)"
+  if [[ -n "$FRONTEND_REPO" ]]; then
+    FRONTEND_DIR="${FRONTEND_REPO}-${feature}"
     PROJECT_TYPE="fullstack"
   else
     FRONTEND_DIR=""
@@ -288,11 +285,10 @@ derive_paths() {
 }
 
 # Read session_name from the static config.
-# Usage: parse_static_session_name <config-name>
+# Usage: parse_static_session_name <config-file>
 parse_static_session_name() {
-  local config_file
-  config_file=$(find_config_file "$1" "static") || die "static config not found for: $1"
-  grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1
+  local config_file="$1"
+  sed -n '/^session_name:/ { s/^session_name: *//; p; q; }' "$config_file"
 }
 
 # Check if a tmux session exists.
@@ -565,25 +561,28 @@ cmd_new() {
   config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config. Run 'tmw init' first."
 
   # Derive paths
-  derive_paths "$config" "$feature"
+  derive_paths "$config_file" "$feature"
 
-  local backend_repo
-  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
+  local prefix branch
+  prefix="$(get_branch_prefix)"
+  branch="${prefix}${feature}"
+  if [[ -n "$prefix" ]]; then
+    info "Using branch prefix from ${CONFIG_FILE}: '${prefix}'"
+  else
+    info "Using branch prefix from ${CONFIG_FILE}: <none>"
+  fi
 
   # Create backend worktree if dir doesn't exist
   if [[ ! -d "$BACKEND_DIR" ]]; then
     info "Creating backend worktree: $BACKEND_DIR"
-    local prefix
-    prefix=$(get_branch_prefix)
-    local branch="${prefix}${feature}"
     # Check if branch already exists
-    if git -C "$backend_repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
+    if git -C "$BACKEND_REPO" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
       info "Branch ${branch} already exists, attaching to it"
-      git -C "$backend_repo" worktree add "$BACKEND_DIR" "$branch"
+      git -C "$BACKEND_REPO" worktree add "$BACKEND_DIR" "$branch"
     else
       local default_branch
-      default_branch=$(get_default_branch "$backend_repo")
-      git -C "$backend_repo" worktree add -b "$branch" "$BACKEND_DIR" "$default_branch"
+      default_branch=$(get_default_branch "$BACKEND_REPO")
+      git -C "$BACKEND_REPO" worktree add -b "$branch" "$BACKEND_DIR" "$default_branch"
     fi
   else
     info "Backend worktree already exists: $BACKEND_DIR"
@@ -591,21 +590,15 @@ cmd_new() {
 
   # Create frontend worktree if fullstack
   if [[ "$PROJECT_TYPE" == "fullstack" ]]; then
-    local frontend_repo
-    frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO")"
-
     if [[ ! -d "$FRONTEND_DIR" ]]; then
       info "Creating frontend worktree: $FRONTEND_DIR"
-      local prefix
-      prefix=$(get_branch_prefix)
-      local branch="${prefix}${feature}"
-      if git -C "$frontend_repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
+      if git -C "$FRONTEND_REPO" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
         info "Branch ${branch} already exists, attaching to it"
-        git -C "$frontend_repo" worktree add "$FRONTEND_DIR" "$branch"
+        git -C "$FRONTEND_REPO" worktree add "$FRONTEND_DIR" "$branch"
       else
         local default_branch
-        default_branch=$(get_default_branch "$frontend_repo")
-        git -C "$frontend_repo" worktree add -b "$branch" "$FRONTEND_DIR" "$default_branch"
+        default_branch=$(get_default_branch "$FRONTEND_REPO")
+        git -C "$FRONTEND_REPO" worktree add -b "$branch" "$FRONTEND_DIR" "$default_branch"
       fi
     else
       info "Frontend worktree already exists: $FRONTEND_DIR"
@@ -653,9 +646,11 @@ cmd_kill() {
   config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config"
 
   # Derive session name and paths
-  local session_name
-  session_name="$(derive_session_name "$config" "$feature")"
-  derive_paths "$config" "$feature"
+  derive_paths "$config_file" "$feature"
+
+  local session_template session_name
+  session_template="$(parse_session_template "$config_file")"
+  session_name="$(derive_session_name "$session_template" "$feature")"
 
   # Kill tmux session if it exists
   if session_exists "$session_name"; then
@@ -666,22 +661,18 @@ cmd_kill() {
   fi
 
   # Remove worktrees
-  local backend_repo frontend_repo
-  backend_repo="$(parse_config_env "$config" "BACKEND_REPO")"
-
   if [[ -d "$BACKEND_DIR" ]]; then
     info "Removing backend worktree: $BACKEND_DIR"
-    git -C "$backend_repo" worktree remove "$BACKEND_DIR" 2>/dev/null || \
-      git -C "$backend_repo" worktree remove --force "$BACKEND_DIR" 2>/dev/null || \
+    git -C "$BACKEND_REPO" worktree remove "$BACKEND_DIR" 2>/dev/null || \
+      git -C "$BACKEND_REPO" worktree remove --force "$BACKEND_DIR" 2>/dev/null || \
       warn "Failed to remove backend worktree"
   fi
 
   if [[ "$PROJECT_TYPE" == "fullstack" ]]; then
-    frontend_repo="$(parse_config_env "$config" "FRONTEND_REPO")"
     if [[ -d "$FRONTEND_DIR" ]]; then
       info "Removing frontend worktree: $FRONTEND_DIR"
-      git -C "$frontend_repo" worktree remove "$FRONTEND_DIR" 2>/dev/null || \
-        git -C "$frontend_repo" worktree remove --force "$FRONTEND_DIR" 2>/dev/null || \
+      git -C "$FRONTEND_REPO" worktree remove "$FRONTEND_DIR" 2>/dev/null || \
+        git -C "$FRONTEND_REPO" worktree remove --force "$FRONTEND_DIR" 2>/dev/null || \
         warn "Failed to remove frontend worktree"
     fi
   fi
@@ -714,8 +705,11 @@ cmd_attach() {
 
   # No feature — attach to main-branch session
   if [[ -z "$feature" ]]; then
+    local static_config
+    static_config=$(find_config_file "$config" "static") || die "static config not found for: $config"
+
     local static_session
-    static_session="$(parse_static_session_name "$config")"
+    static_session="$(parse_static_session_name "$static_config")"
     if session_exists "$static_session"; then
       info "Attaching to session: $static_session"
       tmux attach-session -t "$static_session"
@@ -726,11 +720,13 @@ cmd_attach() {
   fi
 
   # Validate worktree config exists and derive session name
-  find_config_file "$config" "worktree" >/dev/null || die "worktree config not found for: $config"
+  local config_file
+  config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config"
 
   # Derive session name
-  local session_name
-  session_name="$(derive_session_name "$config" "$feature")"
+  local session_template session_name
+  session_template="$(parse_session_template "$config_file")"
+  session_name="$(derive_session_name "$session_template" "$feature")"
 
   # Session exists — attach directly
   if session_exists "$session_name"; then
@@ -764,6 +760,7 @@ cmd_list() {
   # Get active tmux sessions
   local tmux_sessions=""
   tmux_sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+  local tmux_sessions_wrapped=$'\n'"$tmux_sessions"$'\n'
 
   # Get current attached session (if any)
   local attached_session=""
@@ -779,8 +776,10 @@ cmd_list() {
   for config_file in "$TMUXP_DIR"/*.worktree.{yaml,yml}; do
     [[ -f "$config_file" ]] || continue
 
-    local config_name
-    config_name="$(basename "$config_file" | sed -E 's/\.worktree\.ya?ml$//')"
+    local config_basename config_name
+    config_basename="${config_file##*/}"
+    config_name="${config_basename%.worktree.yaml}"
+    config_name="${config_name%.worktree.yml}"
 
     # Apply filter
     if [[ -n "$filter_config" && "$config_name" != "$filter_config" ]]; then
@@ -789,37 +788,38 @@ cmd_list() {
 
     # Get backend repo from config
     local backend_repo
-    backend_repo="$(grep '^ *BACKEND_REPO:' "$config_file" | sed 's/^ *BACKEND_REPO: *//' | head -1)"
+    backend_repo="$(parse_config_env "$config_file" "BACKEND_REPO")"
     [[ -n "$backend_repo" ]] || continue
+
+    local session_template
+    session_template="$(parse_session_template "$config_file")"
+    [[ -n "$session_template" ]] || continue
 
     # List worktrees for this repo
     local worktree_list
     worktree_list="$(git -C "$backend_repo" worktree list --porcelain 2>/dev/null || true)"
 
-    # Parse worktrees — find those that are siblings of the repo with config name prefix
-    local repo_parent repo_basename
-    repo_parent="$(dirname "$backend_repo")"
-    repo_basename="$(basename "$backend_repo")"
+    # Parse worktrees — find those matching <repo-basename>-<feature>
+    local repo_basename
+    repo_basename="${backend_repo##*/}"
 
     # Look for worktree dirs matching <repo-basename>-<feature>
     while IFS= read -r line; do
       if [[ "$line" =~ ^worktree\ (.+)$ ]]; then
         local wt_path="${BASH_REMATCH[1]}"
         local wt_basename
-        wt_basename="$(basename "$wt_path")"
+        wt_basename="${wt_path##*/}"
 
         # Check if this worktree matches our naming convention
         if [[ "$wt_basename" == "${repo_basename}-"* ]]; then
           local feature="${wt_basename#${repo_basename}-}"
 
           # Derive session name
-          local session_template
-          session_template="$(grep '^session_name:' "$config_file" | sed 's/^session_name: *//' | head -1)"
           local session_name="${session_template//\$\{WORKTREE\}/$feature}"
 
           # Determine status
           local status="no session"
-          if echo "$tmux_sessions" | grep -qx "$session_name" 2>/dev/null; then
+          if [[ "$tmux_sessions_wrapped" == *$'\n'"$session_name"$'\n'* ]]; then
             if [[ "$session_name" == "$attached_session" ]]; then
               status="attached"
             else

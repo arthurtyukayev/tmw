@@ -94,7 +94,8 @@ Usage: tmw <command> [args]
 Commands:
   init     Generate tmuxp configs for a new project
   new      Create worktrees and start a tmuxp session
-  kill     Kill session and remove worktrees
+  kill     Kill an active tmux session
+  destroy  Kill session and remove worktrees
   attach   Attach to an existing session
   list     List active worktree sessions
   version  Show version information
@@ -166,21 +167,41 @@ EOF
 
 usage_kill() {
   cat <<'EOF'
-Kill tmux session and remove worktrees.
+Kill an active tmux session.
 
-Kills the tmux session, removes worktree directories
-from all repos, and prunes. Does not delete branches.
+Kills the tmux session if it exists. Does not remove
+worktrees or delete branches. Use 'destroy' to also
+remove worktrees.
 
 Usage:
-  tmw kill <config> <feature>
+  tmw kill <session>
+
+Arguments:
+  session   Session name (as shown in tmux list-sessions)
+
+Examples:
+  tmw kill allcore-machine-os
+  tmw kill myapp-feature-name
+EOF
+}
+
+usage_destroy() {
+  cat <<'EOF'
+Destroy worktree session and remove worktrees.
+
+Kills the tmux session, removes worktree directories
+from all repos. Does not delete git branches.
+
+Usage:
+  tmw destroy <config> <feature>
 
 Arguments:
   config    Project name
   feature   Feature name
 
 Examples:
-  tmw kill myapp feature-name
-  tmw kill myproject new-feature
+  tmw destroy myapp feature-name
+  tmw destroy myproject new-feature
 EOF
 }
 
@@ -620,11 +641,41 @@ cmd_new() {
 
 # ─── kill ────────────────────────────────────────────────
 cmd_kill() {
-  local config="" feature=""
+  local session=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h) usage_kill; exit 0 ;;
+      -*)        die "unknown option: $1" ;;
+      *)
+        if [[ -z "$session" ]]; then
+          session="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$session" ]] || die "session name is required. Run 'tmw kill --help' for usage."
+
+  # Kill tmux session if it exists
+  if session_exists "$session"; then
+    info "Killing session: $session"
+    tmux kill-session -t "$session"
+  else
+    warn "Session not found: $session"
+  fi
+}
+
+# ─── destroy ────────────────────────────────────────────────
+cmd_destroy() {
+  local config="" feature=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage_destroy; exit 0 ;;
       -*)        die "unknown option: $1" ;;
       *)
         if [[ -z "$config" ]]; then
@@ -639,8 +690,8 @@ cmd_kill() {
     shift
   done
 
-  [[ -n "$config" ]]  || die "config name is required. Run 'tmw kill --help' for usage."
-  [[ -n "$feature" ]] || die "feature name is required. Run 'tmw kill --help' for usage."
+  [[ -n "$config" ]]  || die "config name is required. Run 'tmw destroy --help' for usage."
+  [[ -n "$feature" ]] || die "feature name is required. Run 'tmw destroy --help' for usage."
 
   local config_file
   config_file=$(find_config_file "$config" "worktree") || die "worktree config not found for: $config"
@@ -859,8 +910,12 @@ main() {
       cmd_new "$@"
       ;;
     kill)
-      require_commands git tmux
+      require_commands tmux
       cmd_kill "$@"
+      ;;
+    destroy)
+      require_commands git tmux
+      cmd_destroy "$@"
       ;;
     attach)
       require_commands tmux
